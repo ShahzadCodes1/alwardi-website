@@ -10,9 +10,15 @@
   if ("scrollRestoration" in history) history.scrollRestoration = "manual";
   if (!location.hash) window.scrollTo(0, 0);
 
-  /* ---------- 00 — Smooth wheel scrolling (mouse / trackpad) ----------
-     A mouse wheel jumps ~100px per notch, which makes scroll-driven scenes
-     move in stop-start steps. Wheel input is eased into one continuous glide.
+  // Shared between the wheel glide and the pinned hero scene
+  const scene = { leash: null };
+
+  /* ---------- 00 — Controlled wheel scrolling (mouse / trackpad) ----------
+     A mouse wheel jumps ~100px per notch and a hard flick can throw the page
+     thousands of pixels in a moment, which makes scroll-driven scenes stutter
+     and lose their rhythm. Wheel input is eased into one continuous glide with
+     a top speed, never queues more than about a screen ahead, and inside the
+     hero scene stays leashed to the animation so the scene sets the pace.
      Keyboard, scrollbar, touch and anchor scrolling stay native. */
   (() => {
     const fine = window.matchMedia("(hover: hover) and (pointer: fine)").matches;
@@ -21,10 +27,22 @@
     const root = document.documentElement;
     let target = window.scrollY, current = target, running = false, last = 0;
     const maxY = () => root.scrollHeight - window.innerHeight;
+    const bounds = () => {
+      const vh = window.innerHeight;
+      let lo = Math.max(0, current - vh * 1.1), hi = Math.min(maxY(), current + vh * 1.1);
+      const L = scene.leash && scene.leash();
+      if (L) { lo = Math.max(lo, Math.min(L[0], current)); hi = Math.min(hi, Math.max(L[1], current)); }
+      return [lo, hi];
+    };
     const step = (now) => {
       const dt = last ? Math.min(64, now - last) : 16.7;
       last = now;
-      current += (target - current) * (1 - Math.pow(1 - 0.11, dt / 16.7));
+      const [lo, hi] = bounds();
+      target = Math.min(hi, Math.max(lo, target));
+      let d = (target - current) * (1 - Math.pow(1 - 0.11, dt / 16.7));
+      const cap = window.innerHeight * 2.4 * dt / 1000;   // top speed: 2.4 screens per second
+      if (d > cap) d = cap; else if (d < -cap) d = -cap;
+      current += d;
       if (Math.abs(target - current) < 0.5) { current = target; running = false; last = 0; }
       window.scrollTo(0, current);
       if (running) requestAnimationFrame(step);
@@ -45,10 +63,11 @@
       e.preventDefault();
       const unit = e.deltaMode === 1 ? 40 : e.deltaMode === 2 ? window.innerHeight : 1;
       if (!running) current = target = window.scrollY;
-      target = Math.max(0, Math.min(maxY(), target + e.deltaY * unit));
+      const [lo, hi] = bounds();
+      target = Math.max(lo, Math.min(hi, target + e.deltaY * unit));
       if (!running) { running = true; requestAnimationFrame(step); }
     }, { passive: false });
-    // Any other scroll (keys, scrollbar, links) becomes the new resting point
+    // Any other scroll (keys, scrollbar, links, autoplay) becomes the new resting point
     window.addEventListener("scroll", () => { if (!running) current = target = window.scrollY; }, { passive: true });
   })();
 
@@ -121,6 +140,28 @@
 
   if (hero) {
     requestAnimationFrame(() => requestAnimationFrame(() => hero.classList.add("is-in")));
+
+    // If the headline block is taller than the screen (short phones, small
+    // windows), step it down until it fits below the nav instead of sliding under it
+    const stageEl = hero.querySelector(".hero__stage");
+    const innerEl = hero.querySelector(".hero__inner");
+    const fitHero = () => {
+      if (!stageEl || !innerEl) return;
+      delete hero.dataset.fit;
+      for (let lv = 1; lv <= 4 && innerEl.offsetHeight > stageEl.clientHeight; lv++) hero.dataset.fit = String(lv);
+    };
+    let fitW = 0, fitH = 0;
+    const refit = () => {
+      // mobile toolbars resize the window on every scroll; only refit on real changes
+      const w = window.innerWidth, h = stageEl ? stageEl.clientHeight : 0;
+      if (w === fitW && Math.abs(h - fitH) < 2) return;
+      fitW = w; fitH = h;
+      fitHero();
+    };
+    refit();
+    window.addEventListener("resize", refit);
+    if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => { fitW = 0; refit(); });
+    window.addEventListener("load", () => { fitW = 0; refit(); }, { once: true });
   }
 
   if (heroVideo) {
@@ -159,7 +200,14 @@
   /* ---------- 02 + 03 — One continuous scene ----------
      The hero is pinned. Scrolling fades the headline, hands the video over
      to a frame sequence of a camera flight across the yard, which lands on
-     the crane-lift shot; the lift then plays with the three statements. */
+     the crane-lift shot; the lift then plays with the three statements.
+
+     Everything on the stage follows a playhead rather than the raw scroll:
+     the playhead chases the scroll at the scene's own pace (never faster than
+     MAX_X times its natural speed), so hard flicks can't make the motion
+     jump, and it never moves onto frames that haven't arrived yet: it waits,
+     like a video buffering, instead of freezing and jumping. On landing the
+     scene also plays by itself until the visitor takes over. */
   const story = document.getElementById("top");
   const canvas = document.getElementById("liftCanvas");
 
@@ -180,10 +228,11 @@
     // Its forward half is also kept as frames (6 fps) so the canvas can take
     // over on the exact frame the video is showing.
     const VID_PERIOD = 16.04, VID_HALF = 8.02, HERO_FPS = 6, HERO_N = 48;
-    // Handover: video freezes at T0, the camera eases back to the flight's first
-    // frame (a short move — longer only if the video was far into its push-in),
-    // and the truck starts moving while the headline is still lifting away.
+    // Natural pace of each part (seconds). Autoplay runs at this pace; scrolling
+    // can go up to MAX_X times faster but never more.
+    const DUR_HAND = 1.4, DUR_FLY = 7.5, DUR_LIFT = 9, MAX_X = 2.4;
 
+    const stage = story.querySelector(".hero__stage");
     const inner = story.querySelector(".hero__inner");
     const heroShade = story.querySelector(".hero__shade");
     const liftShade = story.querySelector(".lift__shade");
@@ -199,92 +248,156 @@
 
     if (!reduce) story.classList.add("has-story");
 
-    let frames = [];
-    let set = "";
-    let ticking = false;
-    let loadedAll = false;
-    let needsDraw = true;
-    let heroFrames = [];
-    let heroU = 0;            // video time (forward-clip seconds) at the freeze
-    let pausedByUs = false;
-    let target = -1, shown = -1, raf = 0, lastKey = -1, onScreen = true;
-
     const clamp01 = (v) => Math.min(1, Math.max(0, v));
     const smooth = (t) => t * t * (3 - 2 * t);
     const lerp = (a, b, t) => a + (b - a) * t;
+
+    let frames = [], heroFrames = [], fDone = new Uint8Array(TOTAL), hDone = new Uint8Array(HERO_N);
+    let set = "";
+    let heroU = 0;            // video time (forward-clip seconds) at the freeze
+    let pausedByUs = false;
+    let pRaw = 0, P = 0, vel = 0, onScreen = true, canvasOn = false, needsDraw = true;
+    let lastKey = -1, raf = 0, lastT = 0;
+    let auto = null;          // autoplay state while the scene plays by itself
+    let stall = 0, gateOff = false, lastLoadAt = 0;
 
     const framePath = (s, i) => i < FLY
       ? `assets/flight/${s}/${String(i + 1).padStart(3, "0")}.jpg`
       : `assets/lift/${s}/${String(i - FLY + 1).padStart(3, "0")}.jpg`;
     const heroPath = (s, k) => `assets/heroseq/${s}/${String(k).padStart(3, "0")}.jpg`;
 
-    // ---- Loading -------------------------------------------------------
-    // Frames come through a small queue (a few at a time) and only start once
-    // the hero video is playing, so the video never stutters while they arrive.
-    const MAX_LOADS = 4;
-    let gen = 0, queue = [], loading = 0, canvasOn = false;
+    // Where the hero video is in its forward clip (seconds)
+    const readVidU = () => {
+      if (!vid || !vid.src || !story.classList.contains("is-ready")) return 0;
+      const tt = (vid.currentTime || 0) % VID_PERIOD;
+      return Math.min(VID_HALF, tt <= VID_HALF ? tt : VID_PERIOD - tt);
+    };
+
+    // ---- Timeline -----------------------------------------------------------
+    const lut = (u, T = FLY_LUT) => {
+      const x = clamp01(u) * (T.length - 1), i = Math.floor(x);
+      return i >= T.length - 1 ? 1 : lerp(T[i], T[i + 1], x - i);
+    };
+    // Handover: video freezes at T0, the camera eases back to the flight's first
+    // frame (a short move, longer only if the video was far into its push-in),
+    // and the truck starts moving while the headline is still lifting away.
+    const T0 = 0.012;
+    const flyStart = () => T0 + 0.006 + 0.026 * (heroU / VID_HALF);
+    // Position on the timeline: v in [-1, 0) is the hero camera easing back,
+    // v >= 0 is the flight (0…191) then the lift (191…263)
+    const targetIndex = (p) => {
+      if (p <= T0) return -1;
+      const P_FLY0 = flyStart();
+      if (p <= P_FLY0) return -1 + smooth((p - T0) / (P_FLY0 - T0));
+      if (p < P_LIFT0) {
+        // short ease-in so the flight launches from the settled camera
+        const u = (p - P_FLY0) / (P_LIFT0 - P_FLY0), A = 0.07, c = 1 / (1 - A / 2);
+        return Math.min(FLY - 1, lut(u < A ? (u * u / (2 * A)) * c : (u - A / 2) * c) * (FLY - 1));
+      }
+      return Math.min(TOTAL - 1, FLY - 1 + lut((p - P_LIFT0) / (1 - P_LIFT0), LIFT_LUT) * LIFT);
+    };
+    const pace = (p) => {
+      const fs = flyStart();
+      if (p < fs) return fs / DUR_HAND;
+      if (p < P_LIFT0) return (P_LIFT0 - fs) / DUR_FLY;
+      return (1 - P_LIFT0) / DUR_LIFT;
+    };
+    const curIdx = () => Math.max(0, Math.floor(targetIndex(P)));
+
+    // ---- Loading ------------------------------------------------------------
+    // Always fetches what the playhead needs next: the hero frames for the
+    // handover, then the frames just ahead, then the rest. Before the visitor
+    // scrolls (or the hero has played a moment) only the first frames load, so
+    // the hero video never competes with them.
+    const MAX_LOADS = 6;
+    let gen = 0, loading = 0, started = false, inflight = new Set();
+    const heroNeed = () => Math.min(HERO_N, Math.ceil((P > T0 ? heroU : readVidU()) * HERO_FPS) + 2);
+    const pick = () => {
+      const tryF = (a, b) => { for (let i = a; i < b; i++) if (!fDone[i] && !inflight.has(i)) return { hero: false, i }; return null; };
+      const tryH = (a, b) => { for (let k = a; k < b; k++) if (!hDone[k] && !inflight.has(-1 - k)) return { hero: true, i: k }; return null; };
+      const tryBack = (c) => { for (let i = c - 1; i >= 0; i--) if (!fDone[i] && !inflight.has(i)) return { hero: false, i }; return null; };
+      if (!started) return tryH(0, 1) || tryF(0, 1);
+      const c = curIdx(), early = P < P_LIFT0;
+      return (early && tryH(0, Math.min(HERO_N, heroNeed() + 4))) || tryF(c, Math.min(TOTAL, c + 40)) ||
+        (early && tryH(0, HERO_N)) || tryF(c, TOTAL) || tryH(0, HERO_N) || tryBack(c);
+    };
     const pump = () => {
-      while (loading < MAX_LOADS && queue.length) {
-        const job = queue.shift();
-        if (job.g !== gen) continue;
+      while (set && loading < (started ? MAX_LOADS : 2)) {
+        const job = pick();
+        if (!job) return;
+        const g = gen, key = job.hero ? -1 - job.i : job.i;
+        inflight.add(key);
         loading++;
         const img = new Image();
         img.decoding = "async";
-        img.onload = () => {
+        let fin = false;
+        const finish = (ok) => {
+          if (fin) return;
+          fin = true;
           loading--;
-          if (job.g === gen) {
-            job.store[job.i] = img;
-            if (canvasOn) { needsDraw = true; kick(); }
+          lastLoadAt = performance.now();
+          if (g === gen) {
+            inflight.delete(key);
+            if (ok) (job.hero ? heroFrames : frames)[job.i] = img;
+            (job.hero ? hDone : fDone)[job.i] = 1;
+            needsDraw = true;
+            kick();
           }
           pump();
         };
-        img.onerror = () => { loading--; pump(); };
-        img.src = job.src;
+        // decode() prepares the pixels off the main thread, so drawing the
+        // frame later doesn't stall the animation
+        img.onload = () => { if (img.decode) img.decode().then(() => finish(true), () => finish(true)); else finish(true); };
+        img.onerror = () => finish(false);
+        img.src = job.hero ? heroPath(set, job.i) : framePath(set, job.i);
       }
     };
-    const enqueue = (store, i, src) => queue.push({ store, i, src, g: gen });
-
     const loadSet = (s) => {
       set = s;
       gen++;
-      queue = [];
+      inflight = new Set();
       frames = new Array(TOTAL);
       heroFrames = new Array(HERO_N);
-      loadedAll = false;
+      fDone = new Uint8Array(TOTAL);
+      hDone = new Uint8Array(HERO_N);
       needsDraw = true;
-      enqueue(frames, 0, framePath(s, 0));
-      enqueue(heroFrames, 0, heroPath(s, 0));
-      enqueue(frames, FLY, framePath(s, FLY));
       pump();
     };
-    // Everything else: hero frames first (needed at the handover), then the
-    // flight coarse-to-fine so it is scrubbable early, then the lift.
-    const loadRest = () => {
-      if (loadedAll || !set) return;
-      loadedAll = true;
-      for (let k = 1; k < HERO_N; k++) enqueue(heroFrames, k, heroPath(set, k));
-      const seen = new Set([0, FLY]);
-      [24, 8, 4, 2, 1].forEach((step) => {
-        for (let i = 0; i < TOTAL; i += step) if (!seen.has(i)) { seen.add(i); enqueue(frames, i, framePath(set, i)); }
-      });
-      pump();
+    const startLoading = () => { if (!started) { started = true; pump(); } };
+
+    // Furthest point the playhead may reach with the frames that have arrived
+    const gateP = () => {
+      if (gateOff) return 1;
+      const need = heroNeed();
+      for (let k = 0; k < need; k++) if (!hDone[k]) return T0;
+      if (!fDone[0]) return T0;
+      let i = curIdx();
+      while (i < TOTAL && fDone[i]) i++;
+      if (i >= TOTAL) return 1;
+      const lim = i - 1;                       // last ready frame in a row
+      if (targetIndex(P) > lim) return P;
+      let lo = P, hi = 1;
+      for (let n = 0; n < 22; n++) { const m = (lo + hi) / 2; if (targetIndex(m) <= lim) lo = m; else hi = m; }
+      return lo;
     };
-    const scheduleRest = () => {
-      let done = false;
-      const go = () => { if (!done) { done = true; loadRest(); } };
-      window.addEventListener("scroll", go, { once: true, passive: true });
-      // On phones, data-saver or slow connections the ~20 MB of frames only
-      // start once the visitor actually scrolls; desktops prefetch after the
-      // hero video is playing so the flight is ready the moment it's needed.
-      const conn = navigator.connection || {};
-      const frugal = portraitMQ.matches || conn.saveData || /(^|-)2g|3g/.test(conn.effectiveType || "");
-      if (frugal) return;
-      if (vid) vid.addEventListener("playing", () => setTimeout(go, 1200), { once: true });
-      const late = () => setTimeout(go, 3500);   // autoplay blocked / no video
-      if (document.readyState === "complete") late();
-      else window.addEventListener("load", late, { once: true });
+    const bufferLevel = () => {
+      const c = curIdx(), n = Math.min(TOTAL, c + 40) - c;
+      let k = 0;
+      for (let i = c; i < c + n; i++) if (fDone[i]) k++;
+      let h = 0;
+      for (let j = 0; j < HERO_N; j++) if (hDone[j]) h++;
+      return P < flyStart() ? (h / HERO_N + k / Math.max(1, n)) / 2 : k / Math.max(1, n);
     };
 
+    // Small "loading" line, shown only if the scene has to wait for frames
+    const buf = document.createElement("div");
+    buf.className = "lift__buffer";
+    buf.setAttribute("aria-hidden", "true");
+    buf.innerHTML = "<i></i>";
+    stage.appendChild(buf);
+    const bufFill = buf.firstChild;
+
+    // ---- Drawing ------------------------------------------------------------
     const srcOf = (hero, i) => (hero ? heroFrames : frames)[i] || null;
 
     const sizeCanvas = () => {
@@ -307,13 +420,6 @@
         if (store[i + d]) return i + d;
       }
       return -1;
-    };
-
-    // Where the hero video is in its forward clip (seconds)
-    const readVidU = () => {
-      if (!vid || !vid.src || !story.classList.contains("is-ready")) return 0;
-      const tt = (vid.currentTime || 0) % VID_PERIOD;
-      return Math.min(VID_HALF, tt <= VID_HALF ? tt : VID_PERIOD - tt);
     };
 
     // Where to draw a frame. Starts exactly where the hero video sits
@@ -346,10 +452,8 @@
       }
     };
 
-    // Draw a position on the timeline. v in [-1, 0): the hero camera easing
-    // back from the frozen frame (v = -1) to its start (v = 0, = flight frame 0).
-    // v >= 0: flight then lift. Neighbouring frames are blended, so no stepping.
-    const draw = (v, fast) => {
+    // Neighbouring frames are blended, so the motion never steps
+    const draw = (v) => {
       if (v < 0) {
         const hk = Math.min(HERO_N - 1, heroU * HERO_FPS * -v);
         const a = Math.floor(hk), t = hk - a;
@@ -364,44 +468,8 @@
       const ia = nearestIdx(frames, TOTAL, a);
       if (ia < 0) return;
       const A = srcOf(false, ia);
-      const ib = !fast && a + 1 < TOTAL ? nearestIdx(frames, TOTAL, a + 1) : -1;
-      paint(fast && t > 0.5 && a + 1 < TOTAL && frames[a + 1] ? frames[a + 1] : A,
-        ib >= 0 ? srcOf(false, ib) : null, t, rectFor(A, v));
-    };
-
-    // Shown frame eases toward the scroll target (soft inertia, no stepping).
-    // Frame-rate independent, so 60 Hz and 120 Hz screens feel the same.
-    let lastT = 0;
-    const tick = (now) => {
-      raf = 0;
-      const dt = lastT ? Math.min(64, now - lastT) : 16.7;
-      lastT = now;
-      const d = target - shown;
-      const k = 1 - Math.pow(1 - 0.28, dt / 16.7);
-      shown = Math.abs(d) < 0.004 ? target : shown + d * k;
-      const key = Math.round(shown * (shown < 0 ? 600 : 48));
-      if (onScreen && canvasOn && (key !== lastKey || needsDraw)) { draw(shown, Math.abs(target - shown) > 2); lastKey = key; needsDraw = false; }
-      if (shown !== target) raf = requestAnimationFrame(tick);
-      else lastT = 0;
-    };
-    const kick = () => { if (!raf) raf = requestAnimationFrame(tick); };
-
-    const lut = (u, T = FLY_LUT) => {
-      const x = clamp01(u) * (T.length - 1), i = Math.floor(x);
-      return i >= T.length - 1 ? 1 : lerp(T[i], T[i + 1], x - i);
-    };
-    const T0 = 0.012;
-    const flyStart = () => T0 + 0.006 + 0.026 * (heroU / VID_HALF);
-    const targetIndex = (p) => {
-      if (p <= T0) return -1;
-      const P_FLY0 = flyStart();
-      if (p <= P_FLY0) return -1 + smooth((p - T0) / (P_FLY0 - T0));
-      if (p < P_LIFT0) {
-        // short ease-in so the flight launches from the settled camera
-        const u = (p - P_FLY0) / (P_LIFT0 - P_FLY0), A = 0.07, c = 1 / (1 - A / 2);
-        return lut(u < A ? (u * u / (2 * A)) * c : (u - A / 2) * c) * (FLY - 1);
-      }
-      return FLY - 1 + lut((p - P_LIFT0) / (1 - P_LIFT0), LIFT_LUT) * LIFT;
+      const ib = a + 1 < TOTAL && frames[a + 1] ? a + 1 : -1;
+      paint(A, ib >= 0 ? srcOf(false, ib) : null, ia === a ? t : 0, rectFor(A, v));
     };
 
     const placeAnchor = () => {
@@ -409,14 +477,8 @@
       if (anchor) anchor.style.top = `${Math.round(total * P_LIFT0 + 2)}px`;
     };
 
-    const render = (force) => {
-      ticking = false;
-      const vh = window.innerHeight;
-      const total = story.offsetHeight - vh;
-      const rect = story.getBoundingClientRect();
-      const p = total > 0 ? clamp01(-rect.top / total) : 0;
-      onScreen = rect.bottom > 0 && rect.top < vh;
-
+    // ---- Everything on the stage, for one playhead position ----------------
+    const apply = (p) => {
       // 1. Headline lifts away
       const textOut = smooth(clamp01(p / P_HEAD));
       inner.style.opacity = (1 - textOut).toFixed(3);
@@ -443,11 +505,9 @@
       heroShade.style.opacity = (1 - smooth(clamp01((p - P_HEAD) / 0.1))).toFixed(3);
 
       // 3. Frame
-      target = Math.min(TOTAL - 1, Math.max(-1, targetIndex(p)));
-      if (force) { needsDraw = true; if (Math.abs(target - shown) > 24) shown = target; }
-      // Crossing the freeze point snaps, so the canvas always starts on the video's frame
-      if (p <= T0) shown = target;
-      kick();
+      const v = Math.min(TOTAL - 1, Math.max(-1, targetIndex(p)));
+      const key = Math.round(v * (v < 0 ? 600 : 48));
+      if (canvasOn && (key !== lastKey || needsDraw)) { draw(v); lastKey = key; needsDraw = false; }
 
       // 4. Lift UI — the shade settles in slowly like dusk, the label after it
       const lp = clamp01((p - P_LIFT0) / (1 - P_LIFT0));
@@ -476,29 +536,200 @@
       });
     };
 
-    const onScrollStory = () => {
-      if (!ticking) { ticking = true; requestAnimationFrame(() => render(false)); }
+    // ---- Playhead loop ------------------------------------------------------
+    const geometry = () => {
+      const vh = window.innerHeight;
+      const rect = story.getBoundingClientRect();
+      return { vh, rect, total: story.offsetHeight - vh, top: rect.top + window.scrollY };
     };
+    let lastApplied = -1;
+    const tick = (now) => {
+      raf = 0;
+      const dt = lastT ? Math.min(0.05, (now - lastT) / 1000) : 1 / 60;
+      lastT = now;
+      const { vh, rect, total, top } = geometry();
+      pRaw = total > 0 ? clamp01(-rect.top / total) : 0;
+      onScreen = rect.bottom > 0 && rect.top < vh;
+
+      let waiting = false;
+      if (!onScreen) {
+        P = pRaw; vel = 0;
+      } else {
+        const g = gateP();
+        let nP;
+        if (auto) {
+          auto.t += dt;
+          const want = pace(P) * smooth(clamp01(auto.t / 1.4));
+          vel += (want - vel) * (1 - Math.exp(-dt * 3));
+          nP = P + vel * dt;
+        } else {
+          const d = pRaw - P, lag = Math.abs(d);
+          // A fast touch fling can't be slowed down, but the stage stays pinned,
+          // so the scene simply follows at its own pace. Only when the page is
+          // about to leave the scene does it hurry to finish.
+          const boost = pRaw > 0.97 ? Math.max(0, lag - 0.04) * 30 : Math.max(0, lag - 0.3) * 3;
+          const cap = pace(P) * MAX_X * (1 + boost);
+          const want = Math.max(-cap, Math.min(cap, d * 5));
+          vel += (want - vel) * (1 - Math.exp(-dt * 8));
+          nP = P + vel * dt;
+          if ((pRaw - nP) * d <= 0 || (lag < 2e-5 && Math.abs(vel) < 2e-4)) { nP = pRaw; vel = 0; }
+        }
+        if (nP > P && nP > g) {               // frames not here yet: wait for them
+          waiting = g - P < 1e-4;
+          nP = Math.max(P, g);
+          vel = Math.min(vel, Math.max(0, (nP - P) / Math.max(dt, 1e-3)));
+        }
+        P = clamp01(nP);
+        if (auto) {
+          window.scrollTo(0, top + P * total);
+          if (P >= 1) {
+            // Scene finished: the rest of the page carries on at the same speed
+            auto = null;
+            if (scene.startTour) scene.startTour(Math.max(120, vel * total));
+          }
+        }
+      }
+
+      // Waiting at the handover: hold the video on its current frame, so the
+      // frames it needs stop changing while they arrive
+      if (waiting && P <= T0 + 1e-6 && vid && vid.src && !vid.paused) { vid.pause(); pausedByUs = true; }
+
+      // Loading indicator (only after a real wait). Waiting only stops if the
+      // network has gone quiet altogether (nothing arrived for 8 s).
+      stall = waiting ? stall + dt : 0;
+      gateOff = started && loading > 0 && performance.now() - lastLoadAt > 8000;
+      buf.classList.toggle("is-on", stall > 0.35);
+      if (stall > 0.35) bufFill.style.transform = `scaleX(${bufferLevel().toFixed(3)})`;
+
+      if (P !== lastApplied || needsDraw) { apply(P); lastApplied = P; }
+      if (auto || waiting || P !== pRaw || vel !== 0) raf = requestAnimationFrame(tick);
+      else lastT = 0;
+    };
+    const kick = () => { if (!raf) raf = requestAnimationFrame(tick); };
+
+    // Wheel scrolling stays within reach of the playhead inside the scene, so
+    // the page never runs ahead of the animation (or leaves it unfinished)
+    scene.leash = () => {
+      if (reduce || auto) return null;
+      const { vh, total, top } = geometry();
+      if (total <= 0 || window.scrollY > top + total + 2) return null;
+      const yp = top + P * total, lead = vh * 0.45;
+      let hi = yp + lead;
+      if (P < 0.998) hi = Math.min(hi, top + total);
+      return [yp - lead, hi];
+    };
+
+    // Read-only snapshot, handy when checking the scene in the browser console
+    scene.state = () => ({ playhead: P, scroll: pRaw, autoplay: auto ? auto.phase : null, waiting: stall > 0,
+      framesLoaded: fDone.reduce((a, b) => a + b, 0), heroFramesLoaded: hDone.reduce((a, b) => a + b, 0) });
+    window.__alwardiScene = scene.state;
+
+    // ---- Autoplay on landing ------------------------------------------------
+    // Two seconds after the page appears the scene starts moving on its own,
+    // then the whole page carries on (see "Autoplay tour" below).
+    // Any wheel, touch, click or key hands control straight back.
+    const conn = navigator.connection || {};
+    const frugal = !!conn.saveData || /(^|-)2g|3g/.test(conn.effectiveType || "");
+    let autoArmed = !reduce && !frugal && !location.hash;
+    const stopAuto = () => {
+      autoArmed = false;
+      if (auto) { auto = null; kick(); }
+    };
+    ["wheel", "touchstart", "pointerdown", "keydown"].forEach((ev) =>
+      window.addEventListener(ev, stopAuto, { passive: true, capture: true }));
+    const tryAuto = () => {
+      if (!autoArmed || auto) return;
+      if (window.scrollY > 4) { autoArmed = false; return; }
+      if (document.visibilityState !== "visible") {
+        document.addEventListener("visibilitychange", () => setTimeout(tryAuto, 1200), { once: true });
+        return;
+      }
+      startLoading();
+      // If frames are still arriving, the playhead simply waits for them
+      autoArmed = false;
+      auto = { phase: "story", t: 0 };
+      vel = 0;
+      kick();
+    };
+    let autoTimer = 0;
+    const armAuto = (ms) => { if (autoArmed && !autoTimer) autoTimer = setTimeout(tryAuto, ms); };
 
     if (!reduce) {
       sizeCanvas();
       placeAnchor();
       loadSet(portraitMQ.matches ? "portrait" : "landscape");
-      scheduleRest();
-      window.addEventListener("scroll", onScrollStory, { passive: true });
-      window.addEventListener("resize", () => { sizeCanvas(); placeAnchor(); render(true); });
+      // The rest of the frames load as soon as the page has loaded (or on the
+      // first scroll), ready for the autoplay at 2 s. Data-saver / slow
+      // connections only load them when the visitor actually scrolls.
+      ["scroll", "wheel", "touchstart", "keydown"].forEach((ev) =>
+        window.addEventListener(ev, startLoading, { once: true, passive: true }));
+      if (!frugal) {
+        armAuto(2000);
+        if (document.readyState === "complete") startLoading();
+        else window.addEventListener("load", startLoading, { once: true });
+      }
+      window.addEventListener("scroll", kick, { passive: true });
+      window.addEventListener("resize", () => { sizeCanvas(); placeAnchor(); needsDraw = true; kick(); });
       portraitMQ.addEventListener("change", (e) => {
-        const had = loadedAll;
         loadSet(e.matches ? "portrait" : "landscape");
-        if (had) loadRest();
-        sizeCanvas(); render(true);
+        sizeCanvas(); needsDraw = true; kick();
       });
-      render(true);
+      apply(0);
+      kick();
     } else {
       // Reduced motion: keep the plain video hero; hide the sequence layers
       [canvas, liftShade, label, progressEl, story.querySelector(".lift__statements")].forEach((el) => el && (el.style.display = "none"));
     }
   }
+
+  /* ---------- Autoplay tour ----------
+     When the hero scene has played by itself, the page keeps moving down to
+     the footer: one continuous glide, slower where there is more to take in
+     (the Construction story, the quote form). Any wheel, touch, click or key
+     stops it for good, so the visitor is always in control. */
+  (() => {
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    const blocks = [...document.querySelectorAll("main > section, main > footer")];
+    // Screens per second, per section
+    const SPEED = { about: 0.34, services: 0.4, construction: 0.36, statement: 0.4, partners: 0.4, contact: 0.3, footer: 0.42 };
+    let on = false, y = 0, v = 0, last = 0, raf = 0, tops = [];
+    const measure = () => {
+      let t = blocks.length ? blocks[0].offsetTop : 0;
+      tops = blocks.map((el) => { const a = t; t += el.offsetHeight; return [a, t, SPEED[el.id] || 0.4]; });
+    };
+    const speedAt = (probe) => {
+      for (const [a, b, sp] of tops) if (probe >= a && probe < b) return sp;
+      return 0.4;
+    };
+    const stop = () => { on = false; if (raf) cancelAnimationFrame(raf); raf = 0; };
+    ["wheel", "touchstart", "pointerdown", "keydown"].forEach((ev) =>
+      window.addEventListener(ev, stop, { passive: true, capture: true }));
+    const step = (now) => {
+      raf = 0;
+      if (!on) return;
+      const dt = last ? Math.min(0.05, (now - last) / 1000) : 1 / 60;
+      last = now;
+      const vh = window.innerHeight;
+      const maxY = document.documentElement.scrollHeight - vh;
+      // eases between section speeds, and settles gently on the very end
+      const want = Math.min(speedAt(y + vh * 0.5) * vh, Math.max(0, maxY - y) * 0.9 + 6);
+      v += (want - v) * (1 - Math.exp(-dt * 1.5));
+      y = Math.min(maxY, y + v * dt);
+      window.scrollTo(0, y);
+      if (y >= maxY - 0.5) { on = false; return; }
+      raf = requestAnimationFrame(step);
+    };
+    scene.startTour = (v0) => {
+      measure();
+      y = window.scrollY;
+      v = v0;
+      last = 0;
+      on = true;
+      if (!raf) raf = requestAnimationFrame(step);
+    };
+    window.addEventListener("resize", () => { if (on) measure(); });
+    window.__alwardiTour = () => on;
+  })();
 
   /* ---------- 05 — Services: truck drive + fleet preview ---------- */
   const drive = document.getElementById("drive");
