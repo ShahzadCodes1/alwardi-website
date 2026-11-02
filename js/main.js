@@ -764,19 +764,58 @@
     const items = [...fleetList.querySelectorAll(".fleet__item")];
     const imgs = [...document.querySelectorAll(".fleet__img")];
     const badge = document.getElementById("fleetBadge");
+    const reduceF = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    let current = 0;
+    // Drive-in: the chosen vehicle pulls into the frame, the previous one drives off
+    const restart = (el, cls) => { el.classList.remove(cls); void el.offsetWidth; el.classList.add(cls); };
     const setActive = (i) => {
+      if (i === current) return;
+      const prev = imgs[current], next = imgs[i];
       items.forEach((el, k) => el.classList.toggle("is-active", k === i));
-      imgs.forEach((el, k) => el.classList.toggle("is-active", k === i));
-      if (badge) badge.innerHTML = `<b>${String(i + 1).padStart(2, "0")}</b> ${imgs[i].dataset.name}`;
+      imgs.forEach((el) => { if (el !== prev && el !== next) el.classList.remove("is-active", "is-entering", "is-leaving"); });
+      prev.classList.remove("is-active", "is-entering");
+      next.classList.remove("is-leaving");
+      next.classList.add("is-active");
+      if (!reduceF) {
+        restart(prev, "is-leaving");
+        restart(next, "is-entering");
+        clearTimeout(prev._t);
+        prev._t = setTimeout(() => prev.classList.remove("is-leaving"), 700);
+      }
+      current = i;
+      if (badge) {
+        badge.innerHTML = `<b>${String(i + 1).padStart(2, "0")}</b> ${next.dataset.name}`;
+        if (!reduceF) restart(badge, "is-swap");
+      }
     };
+    // Gliding the mouse down the list shouldn't fire a car for every row it
+    // crosses: a row has to be under the cursor for a moment first
+    let hoverT = 0;
     items.forEach((el, i) => {
-      el.addEventListener("mouseenter", () => setActive(i));
+      el.addEventListener("mouseenter", () => { clearTimeout(hoverT); hoverT = setTimeout(() => setActive(i), 90); });
+      el.addEventListener("mouseleave", () => clearTimeout(hoverT));
       el.querySelector("a").addEventListener("focus", () => setActive(i));
       el.querySelector("a").addEventListener("click", (e) => {
         window.__alwardiService = e.currentTarget.dataset.service;
         document.dispatchEvent(new CustomEvent("alwardi:service", { detail: window.__alwardiService }));
       });
     });
+
+    // Tablet / phone cards: each vehicle drives into its card the first time
+    // it scrolls into view (cards entering together go one after another)
+    const touchMQ = window.matchMedia("(max-width: 1024px), (hover: none)");
+    if (!reduceF && touchMQ.matches && "IntersectionObserver" in window) {
+      const io = new IntersectionObserver((entries) => {
+        const arriving = entries.filter((en) => en.isIntersecting);
+        arriving.forEach((en, k) => {
+          const it = en.target;
+          it.style.setProperty("--d", `${Math.min(k, 5) * 0.12}s`);
+          it.dataset.in = "1";
+          io.unobserve(it);
+        });
+      }, { rootMargin: "0px 0px -12% 0px", threshold: 0.2 });
+      items.forEach((it) => { it.dataset.in = "0"; io.observe(it); });
+    }
   }
 
   /* ---------- 06 — Construction: full-screen expand ---------- */

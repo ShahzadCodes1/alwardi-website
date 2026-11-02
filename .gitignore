@@ -8,3 +8,5 @@ assets/img/construction-wide.webp
 .DS_Store
 Thumbs.db
 desktop.ini
+# original full-size AI images (web versions live in assets/fleet/)
+assets/fleet/new/
