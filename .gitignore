@@ -1,0 +1,10 @@
+assets/fonts/
+assets/img/alwardi-logo.png
+assets/img/alwardi-logo-light.png
+assets/img/construction.webp
+assets/img/construction-wide.webp
+*.zip
+*.glb
+.DS_Store
+Thumbs.db
+desktop.ini

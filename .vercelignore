@@ -1,0 +1,12 @@
+# Files in the project folder that the website does not use.
+# They stay on your computer but are not uploaded to Vercel.
+assets/fonts/
+assets/img/alwardi-logo.png
+assets/img/alwardi-logo-light.png
+assets/img/construction.webp
+assets/img/construction-wide.webp
+*.zip
+*.glb
+.DS_Store
+Thumbs.db
+desktop.ini
